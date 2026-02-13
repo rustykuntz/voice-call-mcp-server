@@ -10,6 +10,7 @@ import { OpenAIEventService } from '../services/openai/event.service.js';
 import { TwilioEventService } from '../services/twilio/event.service.js';
 import { SessionManagerService } from '../services/session-manager.service.js';
 import { TwilioCallService } from '../services/twilio/call.service.js';
+import { callTracker } from '../services/call-tracker.js';
 
 dotenv.config();
 
@@ -107,6 +108,9 @@ export class OpenAICallHandler {
             async (message) => await this.twilioEventProcessor.processMessage(message),
             async () => {
                 this.openAIService.close();
+                if (this.callState.callSid) {
+                    callTracker.completeCall(this.callState.callSid, [...this.callState.conversationHistory]);
+                }
             }
         );
     }

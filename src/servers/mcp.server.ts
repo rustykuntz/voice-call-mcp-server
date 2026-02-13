@@ -2,6 +2,7 @@ import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mc
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { TwilioCallService } from '../services/twilio/call.service.js';
+import { callTracker } from '../services/call-tracker.js';
 
 export class VoiceCallMcpServer {
     private server: McpServer;
@@ -26,22 +27,24 @@ export class VoiceCallMcpServer {
     private registerTools(): void {
         this.server.tool(
             'trigger-call',
-            'Trigger an outbound phone call via Twilio',
+            'Trigger an outbound phone call via Twilio. Blocks until the call completes and returns the full transcript.',
             {
                 toNumber: z.string().describe('The phone number to call'),
-                callContext: z.string().describe('Context for the call')
+                callContext: z.string().describe('Context for the call'),
+                timeoutMs: z.number().optional().describe('Max wait time in ms (default 300000 = 5 min)')
             },
-            async ({ toNumber, callContext }) => {
+            async ({ toNumber, callContext, timeoutMs }) => {
                 try {
                     const callSid = await this.twilioCallService.makeCall(this.twilioCallbackUrl, toNumber, callContext);
+                    const transcript = await callTracker.waitForCall(callSid, timeoutMs || 300000);
 
                     return {
                         content: [{
                             type: 'text',
                             text: JSON.stringify({
-                                status: 'success',
-                                message: 'Call triggered successfully',
-                                callSid: callSid
+                                status: 'completed',
+                                callSid,
+                                transcript
                             })
                         }]
                     };
@@ -53,7 +56,7 @@ export class VoiceCallMcpServer {
                             type: 'text',
                             text: JSON.stringify({
                                 status: 'error',
-                                message: `Failed to trigger call: ${errorMessage}`
+                                message: `Call failed: ${errorMessage}`
                             })
                         }],
                         isError: true
@@ -68,13 +71,13 @@ export class VoiceCallMcpServer {
             'get-latest-call',
             new ResourceTemplate('call://transcriptions', { list: undefined }),
             async () => {
-                // TODO: get call transcription
+                const result = callTracker.getLastResult();
                 return {
                     contents: [{
-                        text: JSON.stringify({
-                            transcription: '{}',
-                            status: 'completed',
-                        }),
+                        text: JSON.stringify(result
+                            ? { callSid: result.callSid, transcript: result.transcript, status: 'completed' }
+                            : { transcript: [], status: 'no_calls' }
+                        ),
                         uri: 'call://transcriptions/latest',
                         mimeType: 'application/json'
                     }]
