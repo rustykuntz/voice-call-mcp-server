@@ -1,32 +1,31 @@
 import { WebSocket } from 'ws';
 import { CallState } from '../../types.js';
 import { LOG_EVENT_TYPES, SHOW_TIMING_MATH } from '../../config/constants.js';
-import { checkForGoodbye } from '../../utils/call-utils.js';
 
 /**
  * Service for processing OpenAI events
  */
 export class OpenAIEventService {
     private readonly callState: CallState;
-    private readonly onEndCall: () => void;
+    private readonly onEndCallTool: (callId: string | null, args: Record<string, unknown>) => void;
     private readonly onSendAudioToTwilio: (payload: string) => void;
     private readonly onTruncateResponse: () => void;
 
     /**
      * Create a new OpenAI event processor
      * @param callState The state of the call
-     * @param onEndCall Callback for ending the call
+     * @param onEndCallTool Callback for model end_call tool invocation
      * @param onSendAudioToTwilio Callback for sending audio to Twilio
      * @param onTruncateResponse Callback for truncating the response
      */
     constructor(
         callState: CallState,
-        onEndCall: () => void,
+        onEndCallTool: (callId: string | null, args: Record<string, unknown>) => void,
         onSendAudioToTwilio: (payload: string) => void,
         onTruncateResponse: () => void
     ) {
         this.callState = callState;
-        this.onEndCall = onEndCall;
+        this.onEndCallTool = onEndCallTool;
         this.onSendAudioToTwilio = onSendAudioToTwilio;
         this.onTruncateResponse = onTruncateResponse;
     }
@@ -59,12 +58,17 @@ export class OpenAIEventService {
             this.handleTranscriptionCompleted(response.transcript);
             break;
         case 'response.audio_transcript.done':
+        case 'response.output_audio_transcript.done':
             this.handleAudioTranscriptDone(response.transcript);
             break;
         case 'response.audio.delta':
+        case 'response.output_audio.delta':
             if (response.delta) {
                 this.handleAudioDelta(response);
             }
+            break;
+        case 'response.output_item.done':
+            this.handleOutputItemDone(response.item);
             break;
         case 'input_audio_buffer.speech_started':
             this.onTruncateResponse();
@@ -85,10 +89,6 @@ export class OpenAIEventService {
             role: 'user',
             content: transcription
         });
-
-        if (checkForGoodbye(transcription)) {
-            this.onEndCall();
-        }
     }
 
     /**
@@ -104,6 +104,39 @@ export class OpenAIEventService {
             role: 'assistant',
             content: transcript
         });
+    }
+
+    /**
+     * Handle output item done event
+     * @param item The output item
+     */
+    private handleOutputItemDone(item: any): void {
+        if (!item || item.type !== 'function_call' || item.name !== 'end_call') {
+            return;
+        }
+
+        const args = this.safeParseArgs(item.arguments);
+        this.onEndCallTool(item.call_id || null, args);
+    }
+
+    /**
+     * Parse tool-call arguments
+     * @param rawArgs Tool arguments as JSON string
+     */
+    private safeParseArgs(rawArgs: unknown): Record<string, unknown> {
+        if (typeof rawArgs !== 'string' || !rawArgs.trim()) {
+            return {};
+        }
+
+        try {
+            const parsed = JSON.parse(rawArgs);
+            if (parsed && typeof parsed === 'object') {
+                return parsed as Record<string, unknown>;
+            }
+            return {};
+        } catch {
+            return {};
+        }
     }
 
     /**

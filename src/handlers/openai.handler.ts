@@ -24,6 +24,8 @@ export class OpenAICallHandler {
     private readonly twilioEventProcessor: TwilioEventService;
     private readonly twilioCallService: TwilioCallService;
     private readonly callState: CallState;
+    private endingCall = false;
+    private sessionInitialized = false;
 
     constructor(ws: WebSocket, callType: CallType, twilioClient: twilio.Twilio, contextService: OpenAIContextService) {
         this.callState = new CallState(callType);
@@ -35,7 +37,7 @@ export class OpenAICallHandler {
         // Initialize OpenAI service
         const openAIConfig: OpenAIConfig = {
             apiKey: process.env.OPENAI_API_KEY || '',
-            websocketUrl: process.env.OPENAI_WEBSOCKET_URL || 'wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview',
+            websocketUrl: process.env.OPENAI_WEBSOCKET_URL || 'wss://api.openai.com/v1/realtime?model=gpt-realtime',
             voice: VOICE,
             temperature: 0.6
         };
@@ -44,7 +46,7 @@ export class OpenAICallHandler {
         // Initialize event processors
         this.openAIEventProcessor = new OpenAIEventService(
             this.callState,
-            () => this.endCall(),
+            (callId, args) => this.handleEndCallTool(callId, args),
             (payload) => this.twilioStream.sendAudio(payload),
             () => this.handleSpeechStartedEvent()
         );
@@ -53,14 +55,32 @@ export class OpenAICallHandler {
             this.callState,
             this.twilioCallService,
             contextService,
-            (payload) => this.openAIService.sendAudio(payload),// Log the first media event
+            (payload) => this.openAIService.sendAudio(payload),
         );
 
         this.setupEventHandlers();
         this.initializeOpenAI();
     }
 
+    private handleEndCallTool(callId: string | null, args: Record<string, unknown>): void {
+        if (callId) {
+            this.openAIService.sendFunctionCallOutput(callId, { ok: true, action: 'end_call' });
+        }
+
+        const reason = typeof args.reason === 'string' ? args.reason : '';
+        if (reason) {
+            console.log(`Model requested end_call: ${reason}`);
+        }
+
+        this.endCall();
+    }
+
     private endCall(): void {
+        if (this.endingCall) {
+            return;
+        }
+        this.endingCall = true;
+
         if (this.callState.callSid) {
             this.twilioCallService.endCall(this.callState.callSid);
         }
@@ -75,11 +95,26 @@ export class OpenAICallHandler {
         this.openAIService.close();
     }
 
+    private initializeSessionWhenContextReady(): void {
+        if (this.sessionInitialized || this.endingCall || !this.openAIService.isConnected()) {
+            return;
+        }
+
+        const context = (this.callState.callContext || '').trim();
+        if (!context) {
+            setTimeout(() => this.initializeSessionWhenContextReady(), 50);
+            return;
+        }
+
+        this.sessionInitialized = true;
+        this.openAIService.initializeSession(context);
+    }
+
     private initializeOpenAI(): void {
         this.openAIService.initialize(
             (data) => this.openAIEventProcessor.processMessage(data),
             () => {
-                setTimeout(() => this.openAIService.initializeSession(this.callState.callContext), 100);
+                setTimeout(() => this.initializeSessionWhenContextReady(), 100);
             },
             (error) => console.error('Error in the OpenAI WebSocket:', error)
         );

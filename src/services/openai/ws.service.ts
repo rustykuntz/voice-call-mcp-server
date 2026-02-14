@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 import { OpenAIConfig } from '../../types.js';
-import { SHOW_TIMING_MATH } from '../../config/constants.js';
+import { OPENAI_REALTIME_MODEL, OPENAI_TURN_DETECTION, SHOW_TIMING_MATH } from '../../config/constants.js';
 
 /**
  * Service for handling OpenAI API interactions
@@ -49,19 +49,47 @@ export class OpenAIWsService {
             return;
         }
 
+        const instructions = `${callContext}\n\n## Call Control\n- When the conversation goal is complete or the callee asks to end, call the end_call tool.\n- Before calling end_call, say one short closing line.`;
+
         const sessionUpdate = {
             type: 'session.update',
             session: {
-                turn_detection: { type: 'server_vad' },
-                input_audio_format: 'g711_ulaw',
-                output_audio_format: 'g711_ulaw',
-                voice: this.config.voice,
-                instructions: callContext,
-                modalities: ['text', 'audio'],
-                temperature: this.config.temperature,
-                'input_audio_transcription': {
-                    'model': 'whisper-1'
+                type: 'realtime',
+                model: OPENAI_REALTIME_MODEL,
+                output_modalities: ['audio'],
+                audio: {
+                    input: {
+                        format: { type: 'audio/pcmu' },
+                        turn_detection: { type: OPENAI_TURN_DETECTION }
+                    },
+                    output: {
+                        format: { type: 'audio/pcmu' },
+                        voice: this.config.voice
+                    }
                 },
+                instructions,
+                temperature: this.config.temperature,
+                input_audio_transcription: {
+                    model: 'whisper-1'
+                },
+                tools: [
+                    {
+                        type: 'function',
+                        name: 'end_call',
+                        description: 'End the active phone call when the conversation is complete or the callee requests to end.',
+                        parameters: {
+                            type: 'object',
+                            properties: {
+                                reason: {
+                                    type: 'string',
+                                    description: 'Short reason for ending the call.'
+                                }
+                            },
+                            additionalProperties: false
+                        }
+                    }
+                ],
+                tool_choice: 'auto'
             }
         };
 
@@ -92,6 +120,28 @@ export class OpenAIWsService {
         };
 
         this.webSocket.send(JSON.stringify(audioAppend));
+    }
+
+    /**
+     * Return function-call output to OpenAI
+     * @param callId The function call ID
+     * @param output The output payload
+     */
+    public sendFunctionCallOutput(callId: string, output: Record<string, unknown>): void {
+        if (!this.webSocket || this.webSocket.readyState !== WebSocket.OPEN || !callId) {
+            return;
+        }
+
+        this.webSocket.send(JSON.stringify({
+            type: 'conversation.item.create',
+            item: {
+                type: 'function_call_output',
+                call_id: callId,
+                output: JSON.stringify(output || {})
+            }
+        }));
+
+        this.webSocket.send(JSON.stringify({ type: 'response.create' }));
     }
 
     /**
