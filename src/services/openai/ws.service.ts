@@ -8,6 +8,7 @@ import { OPENAI_REALTIME_MODEL, OPENAI_TURN_DETECTION, SHOW_TIMING_MATH } from '
 export class OpenAIWsService {
     private webSocket: WebSocket | null = null;
     private readonly config: OpenAIConfig;
+    private readonly useGaSessionSchema: boolean;
 
     /**
      * Create a new OpenAI service
@@ -15,6 +16,7 @@ export class OpenAIWsService {
      */
     constructor(config: OpenAIConfig) {
         this.config = config;
+        this.useGaSessionSchema = process.env.OPENAI_SESSION_SCHEMA === 'ga';
     }
 
     /**
@@ -28,11 +30,16 @@ export class OpenAIWsService {
         onOpen: () => void,
         onError: (error: Error) => void
     ): void {
+        const headers: Record<string, string> = {
+            Authorization: `Bearer ${this.config.apiKey}`,
+        };
+        // Current Twilio websocket integrations are typically on the legacy realtime event schema.
+        if (!this.useGaSessionSchema) {
+            headers['OpenAI-Beta'] = 'realtime=v1';
+        }
+
         this.webSocket = new WebSocket(this.config.websocketUrl, {
-            headers: {
-                Authorization: `Bearer ${this.config.apiKey}`,
-                'OpenAI-Beta': 'realtime=v1'
-            }
+            headers
         });
 
         this.webSocket.on('open', onOpen);
@@ -50,48 +57,66 @@ export class OpenAIWsService {
         }
 
         const instructions = `${callContext}\n\n## Call Control\n- When the conversation goal is complete or the callee asks to end, call the end_call tool.\n- Before calling end_call, say one short closing line.`;
-
-        const sessionUpdate = {
-            type: 'session.update',
-            session: {
-                type: 'realtime',
-                model: OPENAI_REALTIME_MODEL,
-                output_modalities: ['audio'],
-                audio: {
-                    input: {
-                        format: { type: 'audio/pcmu' },
-                        turn_detection: { type: OPENAI_TURN_DETECTION }
-                    },
-                    output: {
-                        format: { type: 'audio/pcmu' },
-                        voice: this.config.voice
+        const commonTooling = {
+            input_audio_transcription: {
+                model: 'whisper-1'
+            },
+            tools: [
+                {
+                    type: 'function',
+                    name: 'end_call',
+                    description: 'End the active phone call when the conversation is complete or the callee requests to end.',
+                    parameters: {
+                        type: 'object',
+                        properties: {
+                            reason: {
+                                type: 'string',
+                                description: 'Short reason for ending the call.'
+                            }
+                        },
+                        additionalProperties: false
                     }
-                },
-                instructions,
-                temperature: this.config.temperature,
-                input_audio_transcription: {
-                    model: 'whisper-1'
-                },
-                tools: [
-                    {
-                        type: 'function',
-                        name: 'end_call',
-                        description: 'End the active phone call when the conversation is complete or the callee requests to end.',
-                        parameters: {
-                            type: 'object',
-                            properties: {
-                                reason: {
-                                    type: 'string',
-                                    description: 'Short reason for ending the call.'
-                                }
-                            },
-                            additionalProperties: false
-                        }
-                    }
-                ],
-                tool_choice: 'auto'
-            }
+                }
+            ],
+            tool_choice: 'auto'
         };
+
+        const sessionUpdate = this.useGaSessionSchema
+            ? {
+                type: 'session.update',
+                session: {
+                    type: 'realtime',
+                    model: OPENAI_REALTIME_MODEL,
+                    output_modalities: ['audio'],
+                    audio: {
+                        input: {
+                            format: { type: 'audio/pcmu' },
+                            turn_detection: { type: OPENAI_TURN_DETECTION }
+                        },
+                        output: {
+                            format: { type: 'audio/pcmu' },
+                            voice: this.config.voice
+                        }
+                    },
+                    instructions,
+                    temperature: this.config.temperature,
+                    ...commonTooling
+                }
+            }
+            : {
+                type: 'session.update',
+                session: {
+                    // Legacy realtime websocket schema (Twilio-compatible today).
+                    turn_detection: { type: OPENAI_TURN_DETECTION === 'semantic_vad' ? 'server_vad' : OPENAI_TURN_DETECTION },
+                    input_audio_format: 'g711_ulaw',
+                    output_audio_format: 'g711_ulaw',
+                    voice: this.config.voice,
+                    instructions,
+                    modalities: ['text', 'audio'],
+                    temperature: this.config.temperature,
+                    ...commonTooling
+                }
+            };
 
         this.webSocket.send(JSON.stringify(sessionUpdate));
     }
